@@ -1,0 +1,16 @@
+# 秘密情報（サービスアカウント鍵・接続設定）
+todo-app/.streamlit/secrets.toml
+*.json
+!todo-app/**/*.json.example
+
+# Python
+__pycache__/
+*.pyc
+
+# 旧SQLiteデータ（現在はGoogle スプレッドシートを使用）
+todo-app/data.db
+
+# エディタ・OS・Claude Code関連
+.claude/
+.DS_Store
+Thumbs.db
