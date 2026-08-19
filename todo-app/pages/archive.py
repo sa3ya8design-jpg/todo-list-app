@@ -9,6 +9,7 @@ import streamlit as st
 
 import db
 import logic
+from models import KIND_LABELS, format_amount
 from task_row import render_task_row
 
 
@@ -16,7 +17,7 @@ def _render_archive_list() -> None:
     st.title("完了プロジェクト")
     st.caption("完了にしたプロジェクトの置き場所です。タスクと完了履歴は保持されます。")
 
-    projects = [p for p in db.list_projects(include_archived=True) if p.is_archived]
+    projects = [p for p in db.list_projects() if p.is_completed]
     if not projects:
         st.caption("完了にしたプロジェクトはありません")
 
@@ -47,8 +48,15 @@ def _render_archived_project_detail(project_id: str) -> None:
 
     st.title(project.name)
 
+    meta_parts = [f"種類: {KIND_LABELS[project.kind]}"]
+    amount_text = format_amount(project.amount)
+    if amount_text:
+        meta_parts.append(f"受注金額: {amount_text}")
+    st.caption(" ・ ".join(meta_parts))
+
     if st.button("進行中に戻す"):
-        db.set_project_archived(project.id, False)
+        # ステータスは1段階前の「請求済」に戻す（詳細画面のセレクトで変更できる）
+        db.set_project_status(project.id, "invoiced")
         st.session_state.pop("archive_selected_project_id", None)
         st.rerun()
 

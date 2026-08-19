@@ -1,7 +1,7 @@
 """データの保存・取得を Google スプレッドシートで行うモジュール。
 
-公開関数のインターフェースは旧SQLite版と同じにしてあり、画面側のコードは変更不要。
-1つのスプレッドシートに projects / tasks の2ワークシートを持ち、1行目をヘッダーとする。
+1つのスプレッドシートに projects / tasks / process_steps の3ワークシートを持ち、
+1行目をヘッダーとする。
 Sheets APIは遅いため、読み取りは短時間キャッシュし、書き込み時にキャッシュを破棄する。
 
 認証はサービスアカウント方式。鍵は .streamlit/secrets.toml の [gcp_service_account] に設定する。
@@ -9,18 +9,38 @@ Sheets APIは遅いため、読み取りは短時間キャッシュし、書き�
 """
 
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import gspread
 import streamlit as st
 from google.oauth2.service_account import Credentials
 
-from models import Priority, Project, Task
+from models import KIND_LABELS, Kind, Priority, ProcessStep, Project, Status, Task
 
-PROJECT_HEADERS = ["id", "name", "color", "is_archived", "created_at", "updated_at"]
+PROJECT_HEADERS = [
+    "id", "name", "color", "status", "kind", "amount", "created_at", "updated_at",
+]
 TASK_HEADERS = [
     "id", "project_id", "title", "memo", "priority", "due_date",
     "completed", "completed_at", "sort_order", "created_at", "updated_at",
+]
+STEP_HEADERS = [
+    "id", "name", "sort_order",
+    "default_design", "default_ai_system", "default_resale", "default_other",
+]
+
+# 工程マスタの初期データ（工程名, デフォルトONにする案件の種類）。設定画面で変更できる
+_SEED_STEPS: list[tuple[str, tuple[Kind, ...]]] = [
+    ("ヒアリング", ("design", "ai_system")),
+    ("サイトマップ", ("design",)),
+    ("見積もり", ("design", "ai_system")),
+    ("提案書", ("design", "ai_system")),
+    ("ライティング", ()),
+    ("ワイヤーフレーム", ("design",)),
+    ("デザイン", ("design",)),
+    ("実装", ("ai_system",)),
+    ("設定", ("ai_system",)),
+    ("リサーチ", ("resale",)),
 ]
 
 _SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -50,15 +70,17 @@ def init_db() -> None:
 
 
 @st.cache_resource
-def _get_worksheets() -> tuple[gspread.Worksheet, gspread.Worksheet]:
+def _get_worksheets() -> tuple[gspread.Worksheet, gspread.Worksheet, gspread.Worksheet]:
     creds = Credentials.from_service_account_info(
         dict(st.secrets["gcp_service_account"]), scopes=_SCOPES
     )
     spreadsheet = gspread.authorize(creds).open_by_key(st.secrets["spreadsheet_id"])
-    return (
-        _ensure_worksheet(spreadsheet, "projects", PROJECT_HEADERS),
-        _ensure_worksheet(spreadsheet, "tasks", TASK_HEADERS),
-    )
+    projects_ws = _ensure_worksheet(spreadsheet, "projects", PROJECT_HEADERS)
+    tasks_ws = _ensure_worksheet(spreadsheet, "tasks", TASK_HEADERS)
+    steps_ws = _ensure_worksheet(spreadsheet, "process_steps", STEP_HEADERS)
+    _migrate_projects_sheet(projects_ws)
+    _seed_steps_if_empty(steps_ws)
+    return projects_ws, tasks_ws, steps_ws
 
 
 def _ensure_worksheet(
@@ -73,23 +95,64 @@ def _ensure_worksheet(
     return worksheet
 
 
+def _migrate_projects_sheet(worksheet: gspread.Worksheet) -> None:
+    """旧形式（is_archived列）のprojectsシートを新形式（status/kind/amount列）へ変換する。"""
+    header = worksheet.row_values(1)
+    if header == PROJECT_HEADERS:
+        return
+    rows = []
+    for row in worksheet.get_all_records():
+        status = row.get("status") or (
+            "completed" if int(row.get("is_archived") or 0) else "in_progress"
+        )
+        rows.append([
+            row["id"],
+            row["name"],
+            row["color"],
+            status,
+            row.get("kind") or "other",
+            row.get("amount", ""),
+            row["created_at"],
+            row["updated_at"],
+        ])
+    worksheet.clear()
+    worksheet.update(values=[PROJECT_HEADERS] + rows, range_name="A1")
+
+
+def _seed_steps_if_empty(worksheet: gspread.Worksheet) -> None:
+    if len(worksheet.get_all_values()) > 1:
+        return
+    steps = [
+        ProcessStep(id=str(uuid.uuid4()), name=name, sort_order=index, default_kinds=set(kinds))
+        for index, (name, kinds) in enumerate(_SEED_STEPS)
+    ]
+    worksheet.append_rows([_step_to_row(step) for step in steps])
+
+
 # --- 読み取り（キャッシュ付き） ---------------------------------------------
 
 @st.cache_data(ttl=_CACHE_TTL_SECONDS)
 def _load_project_rows() -> list[dict]:
-    projects_ws, _ = _get_worksheets()
+    projects_ws, _, _ = _get_worksheets()
     return projects_ws.get_all_records()
 
 
 @st.cache_data(ttl=_CACHE_TTL_SECONDS)
 def _load_task_rows() -> list[dict]:
-    _, tasks_ws = _get_worksheets()
+    _, tasks_ws, _ = _get_worksheets()
     return tasks_ws.get_all_records()
+
+
+@st.cache_data(ttl=_CACHE_TTL_SECONDS)
+def _load_step_rows() -> list[dict]:
+    _, _, steps_ws = _get_worksheets()
+    return steps_ws.get_all_records()
 
 
 def _clear_cache() -> None:
     _load_project_rows.clear()
     _load_task_rows.clear()
+    _load_step_rows.clear()
 
 
 def _row_number_by_id(rows: list[dict], entity_id: str) -> int | None:
@@ -107,7 +170,9 @@ def _row_to_project(row: dict) -> Project:
         id=str(row["id"]),
         name=str(row["name"]),
         color=str(row["color"]),
-        is_archived=bool(int(row["is_archived"] or 0)),
+        status=str(row["status"]),
+        kind=str(row["kind"]),
+        amount=int(row["amount"]) if row.get("amount") not in ("", None) else None,
         created_at=datetime.fromisoformat(str(row["created_at"])),
         updated_at=datetime.fromisoformat(str(row["updated_at"])),
     )
@@ -118,7 +183,9 @@ def _project_to_row(project: Project) -> list:
         project.id,
         project.name,
         project.color,
-        int(project.is_archived),
+        project.status,
+        project.kind,
+        project.amount if project.amount is not None else "",
         project.created_at.isoformat(),
         project.updated_at.isoformat(),
     ]
@@ -156,12 +223,29 @@ def _task_to_row(task: Task) -> list:
     ]
 
 
+def _row_to_step(row: dict) -> ProcessStep:
+    return ProcessStep(
+        id=str(row["id"]),
+        name=str(row["name"]),
+        sort_order=int(row["sort_order"] or 0),
+        default_kinds={
+            kind for kind in KIND_LABELS if int(row.get(f"default_{kind}") or 0)
+        },
+    )
+
+
+def _step_to_row(step: ProcessStep) -> list:
+    return [step.id, step.name, step.sort_order] + [
+        int(kind in step.default_kinds) for kind in KIND_LABELS
+    ]
+
+
 # --- Project ---------------------------------------------------------------
 
-def list_projects(include_archived: bool = True) -> list[Project]:
+def list_projects(include_completed: bool = True) -> list[Project]:
     projects = [_row_to_project(row) for row in _load_project_rows()]
-    if not include_archived:
-        projects = [p for p in projects if not p.is_archived]
+    if not include_completed:
+        projects = [p for p in projects if not p.is_completed]
     return sorted(projects, key=lambda p: p.created_at)
 
 
@@ -172,17 +256,21 @@ def get_project(project_id: str) -> Project | None:
     return None
 
 
-def create_project(name: str, color: str) -> Project:
+def create_project(
+    name: str, color: str, kind: Kind = "other", amount: int | None = None
+) -> Project:
     now = datetime.now()
     project = Project(
         id=str(uuid.uuid4()),
         name=name,
         color=color,
-        is_archived=False,
+        status="proposal",
+        kind=kind,
+        amount=amount,
         created_at=now,
         updated_at=now,
     )
-    projects_ws, _ = _get_worksheets()
+    projects_ws, _, _ = _get_worksheets()
     projects_ws.append_row(_project_to_row(project))
     _clear_cache()
     return project
@@ -190,7 +278,7 @@ def create_project(name: str, color: str) -> Project:
 
 def _write_project(project: Project) -> None:
     project.updated_at = datetime.now()
-    projects_ws, _ = _get_worksheets()
+    projects_ws, _, _ = _get_worksheets()
     row_number = _row_number_by_id(_load_project_rows(), project.id)
     if row_number is not None:
         projects_ws.update(values=[_project_to_row(project)], range_name=f"A{row_number}")
@@ -203,7 +291,7 @@ def update_project(project: Project) -> None:
 
 def delete_project(project_id: str) -> None:
     """プロジェクトと、そのプロジェクトに属するタスクをまとめて削除する。"""
-    projects_ws, tasks_ws = _get_worksheets()
+    projects_ws, tasks_ws, _ = _get_worksheets()
 
     task_rows = _load_task_rows()
     doomed = [
@@ -220,11 +308,11 @@ def delete_project(project_id: str) -> None:
     _clear_cache()
 
 
-def set_project_archived(project_id: str, is_archived: bool) -> None:
+def set_project_status(project_id: str, status: Status) -> None:
     project = get_project(project_id)
     if project is None:
         return
-    project.is_archived = is_archived
+    project.status = status
     _write_project(project)
 
 
@@ -267,15 +355,42 @@ def create_task(
         created_at=now,
         updated_at=now,
     )
-    _, tasks_ws = _get_worksheets()
+    _, tasks_ws, _ = _get_worksheets()
     tasks_ws.append_row(_task_to_row(task))
     _clear_cache()
     return task
 
 
+def create_tasks(titles: list[str], project_id: str) -> None:
+    """複数タスクを一括作成する（工程チェックリストからの投入用。API呼び出しは1回）。"""
+    base = datetime.now()
+    tasks = []
+    for index, title in enumerate(titles):
+        # 作成順を保つため作成日時をわずかにずらす（表示順は 優先度→期限→作成日時）
+        now = base + timedelta(microseconds=index)
+        tasks.append(Task(
+            id=str(uuid.uuid4()),
+            project_id=project_id,
+            title=title,
+            memo="",
+            priority="medium",
+            due_date=None,
+            completed=False,
+            completed_at=None,
+            sort_order=index,
+            created_at=now,
+            updated_at=now,
+        ))
+    if not tasks:
+        return
+    _, tasks_ws, _ = _get_worksheets()
+    tasks_ws.append_rows([_task_to_row(task) for task in tasks])
+    _clear_cache()
+
+
 def _write_task(task: Task) -> None:
     task.updated_at = datetime.now()
-    _, tasks_ws = _get_worksheets()
+    _, tasks_ws, _ = _get_worksheets()
     row_number = _row_number_by_id(_load_task_rows(), task.id)
     if row_number is not None:
         tasks_ws.update(values=[_task_to_row(task)], range_name=f"A{row_number}")
@@ -287,7 +402,7 @@ def update_task(task: Task) -> None:
 
 
 def delete_task(task_id: str) -> None:
-    _, tasks_ws = _get_worksheets()
+    _, tasks_ws, _ = _get_worksheets()
     row_number = _row_number_by_id(_load_task_rows(), task_id)
     if row_number is not None:
         tasks_ws.delete_rows(row_number)
@@ -309,3 +424,19 @@ def postpone_task(task_id: str, new_due_date: date) -> None:
         return
     task.due_date = new_due_date
     _write_task(task)
+
+
+# --- ProcessStep（工程マスタ） ----------------------------------------------
+
+def list_process_steps() -> list[ProcessStep]:
+    steps = [_row_to_step(row) for row in _load_step_rows()]
+    return sorted(steps, key=lambda s: s.sort_order)
+
+
+def save_process_steps(steps: list[ProcessStep]) -> None:
+    """工程マスタを丸ごと置き換える（工程設定画面の保存用）。"""
+    _, _, steps_ws = _get_worksheets()
+    rows = [_step_to_row(step) for step in sorted(steps, key=lambda s: s.sort_order)]
+    steps_ws.clear()
+    steps_ws.update(values=[STEP_HEADERS] + rows, range_name="A1")
+    _clear_cache()

@@ -37,7 +37,7 @@ def open_task_modal(task_id: str | None, default_project_id: str | None = None) 
         st.session_state["_task_modal_confirm_delete"] = False
 
     task = db.get_task(task_id) if task_id else None
-    projects = db.list_projects(include_archived=False)
+    projects = db.list_projects(include_completed=False)
     project_options = _project_options(projects)
     project_labels = list(project_options.keys())
 

@@ -15,7 +15,7 @@ from task_row import render_task_row
 st.title("ホーム")
 st.caption("今やるべきこと")
 
-if st.button("+ 新しいタスク", type="primary"):
+if st.button("新しいタスク", icon=":material/add:", type="primary"):
     open_task_modal(None)
 
 tasks = db.list_tasks(include_completed=False)
