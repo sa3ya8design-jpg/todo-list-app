@@ -1,5 +1,13 @@
 """画面全体の入り口（Streamlit が起動するファイル）。"""
 
+import sys
+from pathlib import Path
+
+# Streamlit Cloud はリポジトリのルートから "todo-app/app.py" を実行するため、
+# 同じフォルダ内の db / colors / models を読み込めるよう明示的にパスを通す
+# （pages/配下の各ファイルも同じ理由で同様の対策をしている）
+sys.path.append(str(Path(__file__).parent))
+
 import streamlit as st
 
 import db
